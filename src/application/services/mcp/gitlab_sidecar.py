@@ -3,6 +3,7 @@ import os, urllib.parse
 import httpx
 from typing import Optional
 from mcp.server.fastmcp import FastMCP
+from python_a2a import AgentCard
 
 mcp = FastMCP("gitlab-extra")
 

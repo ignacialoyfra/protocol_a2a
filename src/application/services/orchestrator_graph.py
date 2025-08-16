@@ -1,6 +1,7 @@
 from typing import TypedDict, Dict, Any, List
 import requests
 from langgraph.graph import StateGraph, END
+from python_a2a import AgentCard
 
 # Endpoints de tus agentes
 A2A_BASES = ["http://localhost:8001", "http://localhost:8002"]
