@@ -1,7 +1,7 @@
-# agent_search.py — OpenAI-only: genera un resumen "tipo búsqueda" y SIEMPRE devuelve {"internet_text": "..."}
+
 from __future__ import annotations
 import asyncio, json, traceback, os, logging
-from typing import Dict, Any
+
 
 from python_a2a import (
     A2AServer, Message, TextContent, MessageRole,
@@ -10,11 +10,11 @@ from python_a2a import (
 from langgraph.checkpoint.memory import InMemorySaver
 from langchain_openai import ChatOpenAI
 
-# --------- logging básico ----------
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("AgentSearch")
 
-# --------- helper sync/async ----------
+
 def run_async(coro):
     try:
         loop = asyncio.get_running_loop()
@@ -33,7 +33,7 @@ def run_async(coro):
         t = threading.Thread(target=_runner, daemon=True); t.start(); t.join()
         return box.get("res")
 
-# --------- clase del agente ----------
+
 class SearchA2A(A2AServer):
     def __init__(self, host: str = "127.0.0.1", port: int = 8001):
         skill = AgentSkill(
@@ -44,7 +44,7 @@ class SearchA2A(A2AServer):
         card = AgentCard(
             name="Agent Search",
             description="Agente de búsqueda (simulada) vía OpenAI; salida normalizada",
-            url=f"http://{host}:{port}",    # IMPORTANTE: sin '/a2a' aquí
+            url=f"http://{host}:{port}",    
             version="1.0.0",
             skills=[skill],
             authentication=None
@@ -52,13 +52,13 @@ class SearchA2A(A2AServer):
         super().__init__(agent_card=card)
         self._memory = InMemorySaver()
 
-        # Usa el modelo de env si está definido; por defecto gpt-4o-mini
+     
         model_id = "gpt-4o-mini"
         if not os.getenv("OPENAI_API_KEY"):
             log.warning("OPENAI_API_KEY no está definida en este proceso. El agente podría fallar.")
         self._llm = ChatOpenAI(model=model_id, temperature=0.1)
 
-    # --- util: aceptar texto plano o {"query": "..."} ---
+   
     @staticmethod
     def _pick_query(text: str) -> str:
         try:
@@ -84,7 +84,7 @@ class SearchA2A(A2AServer):
                     conversation_id=message.conversation_id
                 )
 
-            # Prompt: estilo "resultado de búsqueda" (sin inventar links)
+            
             system = (
                 "Eres un asistente que redacta un resumen estilo 'resultado de búsqueda'. "
                 "Sé conciso (3–6 líneas), neutral y útil. No inventes enlaces ni datos dudosos. "
@@ -96,7 +96,7 @@ class SearchA2A(A2AServer):
                 "Escribe un breve resumen informativo y práctico (3–6 líneas)."
             )
 
-            # Llamada al modelo (con timeout defensivo)
+         
             try:
                 resp = await asyncio.wait_for(
                     self._llm.ainvoke([{"role": "system", "content": system},
@@ -133,7 +133,7 @@ class SearchA2A(A2AServer):
     def handle_message(self, message: Message) -> Message:
         return run_async(self._handle_async(message))
 
-# --------- main ----------
+
 if __name__ == "__main__":
     host, port = "127.0.0.1", 8001
     print(f"🚀 Agent A2A Search (OpenAI) escuchando en http://{host}:{port}")

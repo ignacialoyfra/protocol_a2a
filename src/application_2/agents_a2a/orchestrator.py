@@ -1,4 +1,4 @@
-# orchestrator.py — envelope con parts[0].text + parseo robusto + thread_id
+
 from __future__ import annotations
 import os, json, time, requests
 from typing import TypedDict
@@ -20,7 +20,7 @@ class State(TypedDict, total=False):
     final_answer: str
     iteration: int
 
-# -------------- HTTP helpers --------------
+
 def _post_a2a_envelope(url: str, user_text: str) -> dict | str:
     headers = {"Content-Type": "application/json", "Accept": "application/json"}
     body = {"role": "user", "content": {"type": "text", "text": user_text}}
@@ -47,25 +47,25 @@ def _extract_agent_text(envelope: dict | str) -> str:
       - string crudo
     """
     if isinstance(envelope, dict):
-        # content.text (algunos servers)
+       
         content = envelope.get("content")
         if isinstance(content, dict) and isinstance(content.get("text"), str):
             return content["text"]
 
-        # parts[0].text (python_a2a típico)
+      
         parts = envelope.get("parts")
         if isinstance(parts, list) and parts:
             first = parts[0]
             if isinstance(first, dict) and isinstance(first.get("text"), str):
                 return first["text"]
 
-        # fallback: devuelve todo el envelope como string para depurar
+      
         return json.dumps(envelope, ensure_ascii=False)
 
-    # envelope no-JSON: string crudo
+  
     return str(envelope)
 
-# -------------- JSON helpers --------------
+
 def _safe_json(raw: str):
     try:
         return json.loads(raw)
@@ -94,7 +94,7 @@ def _extract_final_answer(agent_text: str) -> str:
         return val if isinstance(val, str) else json.dumps(val, ensure_ascii=False)
     return str(parsed) if parsed else "No fue posible formular la respuesta."
 
-# -------------- NODES --------------
+
 def node_search(state: State, *, config: RunnableConfig) -> State:
     q = state["query"]
     env = _post_a2a_envelope(SEARCH_URL, q)
@@ -142,7 +142,7 @@ def _route_after_analysis(state: State) -> str:
     if state.get("iteration", 0) >= MAX_ITERS: return "response"
     return "search"
 
-# -------------- Build & Run --------------
+
 def build_app():
     g = StateGraph(State)
     g.add_node("search", node_search)
@@ -161,7 +161,7 @@ if __name__ == "__main__":
     config: RunnableConfig = {"configurable": {"thread_id": "thread-1"}}
 
     init: State = {
-        "query": "¿Cuantos vasos de agua debo tomar para estar hidratado?",
+        "query": "¿Qué es la berberina y para que sirve?",
         "internet_text": "",
         "sufficient": False,
         "final_answer": "",

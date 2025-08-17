@@ -1,4 +1,4 @@
-# agent_analysis.py — OpenAI, responde "si"/"no" sí o sí
+
 from __future__ import annotations
 import asyncio, json, traceback
 from python_a2a import A2AServer, Message, TextContent, MessageRole, run_server, AgentCard, AgentSkill
