@@ -5,6 +5,7 @@ from python_a2a import A2AServer, Message, TextContent, MessageRole, run_server,
 from langgraph.checkpoint.memory import InMemorySaver
 from langchain_openai import ChatOpenAI
 
+
 def run_async(coro):
     try:
         loop = asyncio.get_running_loop()
@@ -24,6 +25,7 @@ def run_async(coro):
         t.start()
         t.join()
         return box.get("res")
+
 
 class ResponseA2A(A2AServer):
     def __init__(self, host="127.0.0.1", port=8003):

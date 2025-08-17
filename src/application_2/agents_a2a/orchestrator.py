@@ -164,7 +164,7 @@ if __name__ == "__main__":
     config: RunnableConfig = {"configurable": {"thread_id": "thread-1"}}
 
     init: State = {
-        "query": "¿Qué es la berberina y para que sirve?",
+        "query": "Desde hoy, ¿cuantos días faltan para navidad? Considerando que hoy es 17 de Octubre 2025",
         "internet_text": "",
         "sufficient": False,
         "final_answer": "",
