@@ -102,6 +102,8 @@ def node_search(state: State, *, config: RunnableConfig) -> State:
     print("############## ENVELOPE search ##############")
     print(env)
     print("#############################################")
+    meta = env.get("metadata", {}) if isinstance(env, dict) else {}
+    print(f"[analysis][meta] message_id={meta.get('message_id')} parent={meta.get('parent_message_id')}")
 
     agent_text = _extract_agent_text(env)
     internet_text = _extract_internet_text(agent_text).strip()
@@ -116,7 +118,8 @@ def node_analysis(state: State, *, config: RunnableConfig) -> State:
     print("############## ENVELOPE analysis ############")
     print(env)
     print("#############################################")
-
+    meta = env.get("metadata", {}) if isinstance(env, dict) else {}
+    print(f"[analysis][meta] message_id={meta.get('message_id')} parent={meta.get('parent_message_id')}")
     agent_text = _extract_agent_text(env)
     sufficient = _extract_sufficient(agent_text)
 
