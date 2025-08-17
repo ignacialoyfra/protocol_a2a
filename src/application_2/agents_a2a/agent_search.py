@@ -1,12 +1,20 @@
-# agent_search.py — versión simple sin LLM, invoca DuckDuckGo directamente
+# agent_search.py — OpenAI-only: genera un resumen "tipo búsqueda" y SIEMPRE devuelve {"internet_text": "..."}
 from __future__ import annotations
-import asyncio, json, traceback
-from typing import Dict, Any, Optional
+import asyncio, json, traceback, os, logging
+from typing import Dict, Any
 
-from python_a2a import A2AServer, Message, TextContent, MessageRole, run_server, AgentCard, AgentSkill
+from python_a2a import (
+    A2AServer, Message, TextContent, MessageRole,
+    run_server, AgentCard, AgentSkill
+)
 from langgraph.checkpoint.memory import InMemorySaver
-from langchain_community.tools import DuckDuckGoSearchRun
+from langchain_openai import ChatOpenAI
 
+# --------- logging básico ----------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("AgentSearch")
+
+# --------- helper sync/async ----------
 def run_async(coro):
     try:
         loop = asyncio.get_running_loop()
@@ -22,63 +30,97 @@ def run_async(coro):
                 box["res"] = nl.run_until_complete(coro)
             finally:
                 nl.close()
-        t = threading.Thread(target=_runner, daemon=True)
-        t.start()
-        t.join()
+        t = threading.Thread(target=_runner, daemon=True); t.start(); t.join()
         return box.get("res")
 
+# --------- clase del agente ----------
 class SearchA2A(A2AServer):
     def __init__(self, host: str = "127.0.0.1", port: int = 8001):
         skill = AgentSkill(
-            id='get_search',
-            name='get_search',
-            description='Usa esta habilidad para buscar información en Internet'
+            id="search",
+            name="search",
+            description="Genera un breve resumen tipo 'resultado de búsqueda' con OpenAI"
         )
         card = AgentCard(
-            name='Agent Search',
-            description='Agente especializado en búsquedas en Internet',
-            url=f"http://{host}:{port}",  # <-- SIN /a2a al final
+            name="Agent Search",
+            description="Agente de búsqueda (simulada) vía OpenAI; salida normalizada",
+            url=f"http://{host}:{port}",    # IMPORTANTE: sin '/a2a' aquí
             version="1.0.0",
             skills=[skill],
             authentication=None
         )
         super().__init__(agent_card=card)
         self._memory = InMemorySaver()
-        self._search = DuckDuckGoSearchRun()
 
+        # Usa el modelo de env si está definido; por defecto gpt-4o-mini
+        model_id = "gpt-4o-mini"
+        if not os.getenv("OPENAI_API_KEY"):
+            log.warning("OPENAI_API_KEY no está definida en este proceso. El agente podría fallar.")
+        self._llm = ChatOpenAI(model=model_id, temperature=0.1)
+
+    # --- util: aceptar texto plano o {"query": "..."} ---
     @staticmethod
-    def _parse_message(message: Message) -> Dict[str, Any]:
-        text = message.content.text if (message.content and message.content.type == "text") else ""
+    def _pick_query(text: str) -> str:
         try:
-            obj = json.loads(text) if text else {}
-            if isinstance(obj, dict) and ("query" in obj or "output" in obj or "conversation_id" in obj):
-                return {
-                    "query": obj.get("query", ""),
-                    "output": obj.get("output", ""),
-                    "conversation_id": obj.get("conversation_id"),
-                }
+            obj = json.loads(text or "")
+            if isinstance(obj, dict) and obj.get("query"):
+                return str(obj["query"])
         except Exception:
             pass
-        return {"query": text or "", "output": "", "conversation_id": None}
+        return text or ""
 
     async def _handle_async(self, message: Message) -> Message:
         try:
-            parsed = self._parse_message(message)
-            user_query = parsed["query"] or parsed["output"] or ""
-            # Llama directo a DuckDuckGo (sin LLM)
-            try:
-                result = self._search.invoke(user_query)
-                # Devuelve como string plano (el orquestador ya soporta texto plano o {"answer": ...})
-                out_text = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
-            except Exception as e:
-                out_text = json.dumps({"answer": f"[search_error] {e}"}, ensure_ascii=False)
+            raw_in = message.content.text or ""
+            query = self._pick_query(raw_in).strip()
+            log.info(f"[search] query='{query}' len={len(query)}")
 
+            if not query:
+                out = {"internet_text": "[search_error] la consulta llegó vacía al agente search."}
+                return Message(
+                    content=TextContent(text=json.dumps(out, ensure_ascii=False)),
+                    role=MessageRole.AGENT,
+                    parent_message_id=message.message_id,
+                    conversation_id=message.conversation_id
+                )
+
+            # Prompt: estilo "resultado de búsqueda" (sin inventar links)
+            system = (
+                "Eres un asistente que redacta un resumen estilo 'resultado de búsqueda'. "
+                "Sé conciso (3–6 líneas), neutral y útil. No inventes enlaces ni datos dudosos. "
+                "Si la información puede variar, acláralo brevemente."
+            )
+            user = (
+                "Tema/Pregunta del usuario:\n"
+                f"{query}\n\n"
+                "Escribe un breve resumen informativo y práctico (3–6 líneas)."
+            )
+
+            # Llamada al modelo (con timeout defensivo)
+            try:
+                resp = await asyncio.wait_for(
+                    self._llm.ainvoke([{"role": "system", "content": system},
+                                       {"role": "user", "content": user}]),
+                    timeout=120
+                )
+                text = (resp.content or "").strip()
+                if not text:
+                    text = "[search_error] el modelo devolvió contenido vacío."
+            except asyncio.TimeoutError:
+                text = "[search_error] timeout consultando al modelo OpenAI."
+            except Exception as e:
+                log.exception("Fallo OpenAI en Search")
+                text = f"[search_error] fallo OpenAI: {e}"
+
+            payload = json.dumps({"internet_text": text}, ensure_ascii=False)
+            print(f"############## payload ##############\n{payload}")
             return Message(
-                content=TextContent(text=out_text),
+                content=TextContent(text=payload),
                 role=MessageRole.AGENT,
                 parent_message_id=message.message_id,
                 conversation_id=message.conversation_id
             )
+
         except Exception as e:
             err = {"error": str(e), "trace": traceback.format_exc()}
             return Message(
@@ -91,7 +133,8 @@ class SearchA2A(A2AServer):
     def handle_message(self, message: Message) -> Message:
         return run_async(self._handle_async(message))
 
+# --------- main ----------
 if __name__ == "__main__":
     host, port = "127.0.0.1", 8001
-    print(f"🚀 Agent A2A Search escuchando en http://{host}:{port}")
+    print(f"🚀 Agent A2A Search (OpenAI) escuchando en http://{host}:{port}")
     run_server(SearchA2A(host=host, port=port), host=host, port=port)

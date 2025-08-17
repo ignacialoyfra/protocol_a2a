@@ -1,172 +1,179 @@
-# orchestrator.py  — versión robusta con trazas, retries y timeouts
+# orchestrator.py — envelope con parts[0].text + parseo robusto + thread_id
 from __future__ import annotations
-import json, time, uuid, os, math
-from typing import TypedDict, Optional
+import os, json, time, requests
+from typing import TypedDict
 from langgraph.graph import StateGraph, END
-from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.checkpoint.memory import MemorySaver
 from langchain_core.runnables.config import RunnableConfig
-import requests
 
-# ==== CONFIG ====
 SEARCH_URL   = os.getenv("A2A_SEARCH_URL",   "http://127.0.0.1:8001")
 ANALYSIS_URL = os.getenv("A2A_ANALYSIS_URL", "http://127.0.0.1:8002")
 RESPONSE_URL = os.getenv("A2A_RESPONSE_URL", "http://127.0.0.1:8003")
 
-# timeout y reintentos para llamadas a agentes
-A2A_TIMEOUT_SEC   = int(os.getenv("A2A_TIMEOUT_SEC", "300"))   # 300s para cubrir cold-start de Ollama
-A2A_MAX_RETRIES   = int(os.getenv("A2A_MAX_RETRIES", "3"))
-A2A_BACKOFF_START = float(os.getenv("A2A_BACKOFF_START", "1.5"))  # segundos
+A2A_TIMEOUT  = int(os.getenv("A2A_TIMEOUT_SEC", "120"))
+MAX_ITERS    = int(os.getenv("SWARM_MAX_ITERS", "2"))
 
-MAX_ITERS = int(os.getenv("SWARM_MAX_ITERS", "3"))  # evita loops
-
-# ==== A2A CLIENT con retries/backoff ====
-class A2AClient:
-    def __init__(self, base_url: str):
-        self.base_url = base_url.rstrip("/")
-    def ask(self, text: str) -> str:
-        url = f"{self.base_url}/a2a"
-        payload = {"role": "user", "content": {"type": "text", "text": text}}
-        last_err = None
-        for attempt in range(1, A2A_MAX_RETRIES + 1):
-            try:
-                r = requests.post(url, json=payload, timeout=A2A_TIMEOUT_SEC)
-                r.raise_for_status()
-                data = r.json()
-                return data.get("content", {}).get("text", "") or json.dumps(data, ensure_ascii=False)
-            except Exception as e:
-                last_err = e
-                # backoff exponencial suave
-                time.sleep(A2A_BACKOFF_START * (2 ** (attempt - 1)))
-        raise RuntimeError(f"Failed to communicate with agent at {url}. Last error: {last_err}")
-
-# ==== ESTADO ====
-class OrchestratorState(TypedDict, total=False):
+class State(TypedDict, total=False):
     query: str
     internet_text: str
     sufficient: bool
     final_answer: str
     iteration: int
-    conversation_id: str
 
-# ==== HELPERS ====
-def _try_extract_text(raw: str) -> str:
+# -------------- HTTP helpers --------------
+def _post_a2a_envelope(url: str, user_text: str) -> dict | str:
+    headers = {"Content-Type": "application/json", "Accept": "application/json"}
+    body = {"role": "user", "content": {"type": "text", "text": user_text}}
+    r = requests.post(url, json=body, headers=headers, timeout=A2A_TIMEOUT)
+    print(f"[HTTP] {url} -> {r.status_code}, len={len(r.content)}")
+    brief_headers = {k: v for k, v in r.headers.items()
+                     if k.lower() in ("content-type", "content-length", "transfer-encoding")}
+    print("[HTTP] headers:", brief_headers)
+    r.raise_for_status()
     try:
-        obj = json.loads(raw)
-        if isinstance(obj, dict) and "answer" in obj:
-            return str(obj["answer"])
-        if isinstance(obj, str):
-            return obj
-        return json.dumps(obj, ensure_ascii=False)
+        return r.json()
     except Exception:
-        return str(raw)
+        try:
+            return json.loads(r.text)
+        except Exception:
+            return r.text
 
-def _thread_id_from_config(config: Optional[RunnableConfig]) -> str:
+def _extract_agent_text(envelope: dict | str) -> str:
+    """
+    Extrae el texto 'útil' del envelope A2A.
+    Soporta:
+      - {"content":{"type":"text","text":"..."}}
+      - {"parts":[{"text":"...","type":"text"}, ...], "role":"agent"}
+      - string crudo
+    """
+    if isinstance(envelope, dict):
+        # content.text (algunos servers)
+        content = envelope.get("content")
+        if isinstance(content, dict) and isinstance(content.get("text"), str):
+            return content["text"]
+
+        # parts[0].text (python_a2a típico)
+        parts = envelope.get("parts")
+        if isinstance(parts, list) and parts:
+            first = parts[0]
+            if isinstance(first, dict) and isinstance(first.get("text"), str):
+                return first["text"]
+
+        # fallback: devuelve todo el envelope como string para depurar
+        return json.dumps(envelope, ensure_ascii=False)
+
+    # envelope no-JSON: string crudo
+    return str(envelope)
+
+# -------------- JSON helpers --------------
+def _safe_json(raw: str):
     try:
-        return config.get("configurable", {}).get("thread_id") or str(uuid.uuid4())
+        return json.loads(raw)
     except Exception:
-        return str(uuid.uuid4())
+        return raw
 
-def _clip(s: Optional[str], n=220) -> str:
-    if not s:
-        return ""
-    s = s.replace("\n", " ")
-    return s[:n] + ("…" if len(s) > n else "")
+def _extract_internet_text(agent_text: str) -> str:
+    parsed = _safe_json(agent_text)
+    if isinstance(parsed, dict) and "internet_text" in parsed:
+        val = parsed["internet_text"]
+        return val if isinstance(val, str) else json.dumps(val, ensure_ascii=False)
+    return str(parsed)
 
-def _ts():
-    return time.strftime("%H:%M:%S")
+def _extract_sufficient(agent_text: str) -> bool:
+    parsed = _safe_json(agent_text)
+    if isinstance(parsed, dict):
+        verdict = str(parsed.get("sufficient", "")).strip().lower()
+    else:
+        verdict = str(parsed).strip().lower()
+    return verdict.startswith("si") or verdict.startswith("sí") or verdict == "true"
 
-# ==== NODOS ====
-def node_search(state: OrchestratorState, *, config: RunnableConfig) -> OrchestratorState:
-    thread_id = _thread_id_from_config(config)
-    conv_id = state.get("conversation_id") or thread_id
-    payload = {
-        "query": state["query"],
-        "output": "text",
-        "conversation_id": conv_id,
-    }
-    client = A2AClient(SEARCH_URL)
-    try:
-        raw = client.ask(json.dumps(payload, ensure_ascii=False))
-        text = _try_extract_text(raw)
-        if not text.strip():
-            text = "No se obtuvo texto desde el agente de búsqueda."
-    except Exception as e:
-        text = f"[search_error] {e}"
-    print(f"[{_ts()}] ▶ NODE: search  | internet_text: {_clip(text)}")
-    return {"internet_text": text, "iteration": state.get("iteration", 0) + 1}
+def _extract_final_answer(agent_text: str) -> str:
+    parsed = _safe_json(agent_text)
+    if isinstance(parsed, dict) and "final_answer" in parsed:
+        val = parsed["final_answer"]
+        return val if isinstance(val, str) else json.dumps(val, ensure_ascii=False)
+    return str(parsed) if parsed else "No fue posible formular la respuesta."
 
-def node_analysis(state: OrchestratorState, *, config: RunnableConfig) -> OrchestratorState:
-    thread_id = _thread_id_from_config(config)
-    conv_id = state.get("conversation_id") or thread_id
-    payload = {
-        "query": state["query"],
-        "output": state.get("internet_text", ""),
-        "conversation_id": conv_id,
-    }
-    client = A2AClient(ANALYSIS_URL)
-    try:
-        raw = client.ask(json.dumps(payload, ensure_ascii=False))
-        verdict_text = _try_extract_text(raw).strip().lower()
-        sufficient = verdict_text.startswith("si") or verdict_text.startswith("sí") or ("\"si\"" in verdict_text)
-    except Exception as e:
-        sufficient = False
-        verdict_text = f"[analysis_error] {e}"
-    print(f"[{_ts()}] ▶ NODE: analysis  | sufficient: {sufficient}  | verdict_text: {_clip(verdict_text)}")
+# -------------- NODES --------------
+def node_search(state: State, *, config: RunnableConfig) -> State:
+    q = state["query"]
+    env = _post_a2a_envelope(SEARCH_URL, q)
+
+    print("############## ENVELOPE search ##############")
+    print(env)
+    print("#############################################")
+
+    agent_text = _extract_agent_text(env)
+    internet_text = _extract_internet_text(agent_text).strip()
+
+    print(f"[{time.strftime('%H:%M:%S')}] ▶ NODE: search  | internet_text: {internet_text[:160]}...")
+    return {"internet_text": internet_text, "iteration": state.get("iteration", 0) + 1}
+
+def node_analysis(state: State, *, config: RunnableConfig) -> State:
+    payload = {"query": state["query"], "internet_text": state.get("internet_text", "")}
+    env = _post_a2a_envelope(ANALYSIS_URL, json.dumps(payload, ensure_ascii=False))
+
+    print("############## ENVELOPE analysis ############")
+    print(env)
+    print("#############################################")
+
+    agent_text = _extract_agent_text(env)
+    sufficient = _extract_sufficient(agent_text)
+
+    print(f"[{time.strftime('%H:%M:%S')}] ▶ NODE: analysis | sufficient: {sufficient}")
     return {"sufficient": sufficient}
 
-def node_response(state: OrchestratorState, *, config: RunnableConfig) -> OrchestratorState:
-    thread_id = _thread_id_from_config(config)
-    conv_id = state.get("conversation_id") or thread_id
-    payload = {
-        "query": state["query"],
-        "output": state.get("internet_text", ""),
-        "conversation_id": conv_id,
-    }
-    client = A2AClient(RESPONSE_URL)
-    try:
-        raw = client.ask(json.dumps(payload, ensure_ascii=False))
-        final_text = _try_extract_text(raw)
-        if not final_text.strip():
-            final_text = "No fue posible obtener una respuesta del agente Response."
-    except Exception as e:
-        final_text = f"[response_error] {e}\n\nRespuesta breve con lo disponible:\n{_clip(state.get('internet_text',''), 600)}"
-    print(f"[{_ts()}] ▶ NODE: response | final_answer: {_clip(final_text, 600)}")
-    return {"final_answer": final_text}
+def node_response(state: State, *, config: RunnableConfig) -> State:
+    payload = {"query": state["query"], "internet_text": state.get("internet_text", "")}
+    env = _post_a2a_envelope(RESPONSE_URL, json.dumps(payload, ensure_ascii=False))
 
-# ==== ROUTER ====
-def route_from_analysis(state: OrchestratorState) -> str:
-    if state.get("sufficient"):
-        return "response"
-    if state.get("iteration", 0) >= MAX_ITERS:
-        # corte de seguridad: aunque falte info, intentamos response con lo que haya
-        return "response"
+    print("############## ENVELOPE response ############")
+    print(env)
+    print("#############################################")
+
+    agent_text = _extract_agent_text(env)
+    final_answer = _extract_final_answer(agent_text)
+
+    print(f"[{time.strftime('%H:%M:%S')}] ▶ NODE: response| final_answer: {final_answer[:240]}...")
+    return {"final_answer": final_answer}
+
+def _route_after_analysis(state: State) -> str:
+    if state.get("sufficient"): return "response"
+    if state.get("iteration", 0) >= MAX_ITERS: return "response"
     return "search"
 
-# ==== BUILD ====
+# -------------- Build & Run --------------
 def build_app():
-    builder = StateGraph(OrchestratorState)
-    builder.add_node("search", node_search)
-    builder.add_node("analysis", node_analysis)
-    builder.add_node("response", node_response)
-    builder.set_entry_point("search")
-    builder.add_edge("search", "analysis")
-    builder.add_conditional_edges("analysis", route_from_analysis,
-                                  {"response": "response", "search": "search"})
-    builder.add_edge("response", END)
-    return builder.compile(checkpointer=InMemorySaver())
+    g = StateGraph(State)
+    g.add_node("search", node_search)
+    g.add_node("analysis", node_analysis)
+    g.add_node("response", node_response)
 
-# ==== MAIN ====
+    g.set_entry_point("search")
+    g.add_edge("search", "analysis")
+    g.add_conditional_edges("analysis", _route_after_analysis, {"search": "search", "response": "response"})
+    g.add_edge("response", END)
+
+    return g.compile(checkpointer=MemorySaver())
+
 if __name__ == "__main__":
     app = build_app()
-    config: RunnableConfig = {"configurable": {"thread_id": "demo-1"}}
-    init_state: OrchestratorState = {"query": "¿Cuántos vasos de agua se deben beber al día?"}
+    config: RunnableConfig = {"configurable": {"thread_id": "thread-1"}}
 
-    print("\n=== STREAM DEL GRAFO EN TIEMPO REAL ===\n")
-    for event in app.stream(init_state, config):
-        for node, payload in event.items():
-            if node == "__end__":
-                print(f"[{_ts()}] ✔ GRAPH: terminado.\n")
+    init: State = {
+        "query": "¿Cuantos vasos de agua debo tomar para estar hidratado?",
+        "internet_text": "",
+        "sufficient": False,
+        "final_answer": "",
+        "iteration": 0,
+    }
 
-    final_state = app.get_state(config).values
-    print("=== ESTADO FINAL ===")
-    print(json.dumps(final_state, ensure_ascii=False, indent=2))
+    print("=== STREAM ===")
+    for ev in app.stream(init, config=config):
+        print(ev)
+    print("=== FINAL ===")
+    response = app.get_state(config=config).values
+    print(app.get_state(config=config).values)
+    print(f"\nRESPUESTA FINAL:{response.get('final_answer')}")
+    
+  
